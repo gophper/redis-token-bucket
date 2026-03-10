@@ -1,0 +1,1108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网关探测限流防护体系 — 技术分享</title>
+<style>
+
+/* ── Reset ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, "Noto Sans", sans-serif,
+                 "Apple Color Emoji", "Segoe UI Emoji";
+    font-size: 16px;
+    line-height: 1.7;
+    color: #24292f;
+    background: #ffffff;
+    padding: 0;
+    margin: 0;
+}
+
+/* ── Page wrapper ── */
+.page-wrapper {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 48px 40px 80px;
+}
+
+/* ── Headings ── */
+h1, h2, h3, h4, h5, h6 {
+    font-weight: 600;
+    line-height: 1.25;
+    margin-top: 1.5em;
+    margin-bottom: .5em;
+    color: #1f2328;
+}
+h1 { font-size: 2em;   border-bottom: 2px solid #d0d7de; padding-bottom: .3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #d0d7de; padding-bottom: .3em; }
+h3 { font-size: 1.25em; }
+h4 { font-size: 1em; }
+h5 { font-size: .875em; }
+h6 { font-size: .85em; color: #636e7b; }
+
+/* ── Paragraphs & inline ── */
+p { margin: .8em 0; }
+a { color: #0969da; text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { font-weight: 600; }
+em { font-style: italic; }
+
+/* ── Horizontal rule ── */
+hr {
+    border: none;
+    border-top: 2px solid #d0d7de;
+    margin: 2em 0;
+}
+
+/* ── Blockquote ── */
+blockquote {
+    border-left: 4px solid #d0d7de;
+    padding: .5em 1em;
+    color: #636e7b;
+    background: #f6f8fa;
+    border-radius: 0 4px 4px 0;
+    margin: 1em 0;
+}
+blockquote p { margin: .3em 0; }
+
+/* ── Code (inline) ── */
+code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo,
+                 "Courier New", monospace;
+    font-size: .875em;
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: .2em .4em;
+    color: #c9254e;
+}
+
+/* ── Code block ── */
+pre {
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 1em 1.2em;
+    overflow-x: auto;
+    margin: 1em 0;
+    line-height: 1.5;
+}
+pre code {
+    font-size: .875em;
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: #24292f;
+    white-space: pre;          /* preserve ASCII art */
+    word-break: normal;
+    overflow-wrap: normal;
+}
+
+/* ── Tables ── */
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .9em;
+    overflow-x: auto;
+    display: block;
+}
+thead tr { background: #f6f8fa; }
+th, td {
+    border: 1px solid #d0d7de;
+    padding: .45em .9em;
+    text-align: left;
+    vertical-align: top;
+}
+tr:nth-child(even) td { background: #f6f8fa; }
+
+/* ── Lists ── */
+ul, ol {
+    padding-left: 2em;
+    margin: .5em 0;
+}
+li { margin: .3em 0; }
+li > ul, li > ol { margin: .1em 0; }
+
+/* ── Table of Contents (toc extension) ── */
+.toc {
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 1em 1.5em;
+    display: inline-block;
+    min-width: 220px;
+    margin-bottom: 1.5em;
+}
+.toc ul { list-style: none; padding-left: 1em; }
+.toc > ul { padding-left: 0; }
+.toc a { color: #0969da; }
+
+/* ── Print ── */
+@media print {
+    body { background: #fff; color: #000; }
+    .page-wrapper { padding: 0; max-width: 100%; }
+    pre, blockquote { break-inside: avoid; }
+    h1, h2, h3 { break-after: avoid; }
+    a { color: #000; text-decoration: underline; }
+}
+
+</style>
+</head>
+<body>
+<div class="page-wrapper">
+<h1 id="_1">网关探测限流防护体系 — 技术分享</h1>
+<blockquote>
+<p><strong>项目</strong>：fullmesh-go 主动探测平台<br />
+<strong>日期</strong>：2026-03<br />
+<strong>作者</strong>：网络监控团队</p>
+</blockquote>
+<hr />
+<h2 id="_2">一、背景与问题</h2>
+<p>主动探测告警在保障互娱游戏网络质量方面发挥了重要作用。随着探测任务持续增长，探测流量对网关（DNAT/SNAT/LBC/VNFPG 等）构成的压力越来越大。借鉴以往自建探测插件导致 DDoS、给网关造成不可预测故障的教训，我们需要从<strong>可观测性、事前评估、实时拦截</strong>三个维度构建防护体系。</p>
+<h3 id="_3">核心风险</h3>
+<pre><code>┌──────────────────────────────────────────────────────────┐
+│                    探测 Agent 集群                        │
+│   agent-A  agent-B  agent-C  ...  agent-N               │
+└──────────┬───────────────┬───────────────┬───────────────┘
+           │ ICMP/TCP/HTTP │               │
+     ┌─────▼─────┐   ┌────▼────┐    ┌─────▼─────┐
+     │  VNFPG-1  │   │  LBC-2  │    │  SNAT-3   │  ← 网关设备
+     └───────────┘   └─────────┘    └───────────┘
+           ↓               ↓              ↓
+  任务不断增多 → 网关 RPS 不可控 → 可能触发类 DDoS → 网络故障
+</code></pre>
+<p><strong>三大应对措施</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>措施</th>
+<th>目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>可观测</strong></td>
+<td>实时网关压力聚合分析</td>
+<td>观测各网关探测 RPS，配合告警第一时间感知风险</td>
+</tr>
+<tr>
+<td><strong>事前</strong></td>
+<td>增量探测创建时风险检测</td>
+<td>预估新任务对网关的压力增量，给出风险提示</td>
+</tr>
+<tr>
+<td><strong>实时</strong></td>
+<td>多维度可配置实时限流</td>
+<td>拦截突发或不可预测因素导致的探测压力陡增</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_4">二、整体架构</h2>
+<pre><code>                         ┌──────────────────────────────────────────────────────┐
+                         │                    前端 / API                        │
+                         │  POST /risk_check/  →  风险检测入口                  │
+                         │  GET  /risk_check/:event_id  →  查询检测报告         │
+                         └──────────────────┬───────────────────────────────────┘
+                                            │
+┌───────────────────────────────────────────▼────────────────────────────────────────────┐
+│                              fullmesh-go 后端服务集群                                  │
+│                                                                                        │
+│  ┌─────────────────┐   ┌──────────────────┐   ┌────────────────────────────────────┐  │
+│  │  1.网关压力聚合  │   │ 2.创建时风险检测  │   │     3.实时多维度限流                │  │
+│  │                 │   │                  │   │                                    │  │
+│  │ meta_injector   │   │ generic_task_    │   │  Controller (gRPC/HTTP)            │  │
+│  │    ↓            │   │   event          │   │    ├─ GlobalLimit (unary gRPC)     │  │
+│  │ risk_analysis   │   │    ↓             │   │    ├─ BatchGlobalLimit (unary)     │  │
+│  │    ↓            │   │ RiskCheckEvent   │   │    ├─ HandleGlobalLimit (stream)   │  │
+│  │ VictoriaMetrics │   │    ↓             │   │    └─ /api/v2/batch_rate_limit     │  │
+│  │                 │   │ Report + Tips    │   │                                    │  │
+│  │  指标:          │   │                  │   │  RateLimitSvc                      │  │
+│  │  rtt_gw_pressure│   │                  │   │   ├─ MongoDB 动态配置              │  │
+│  │                 │   │                  │   │   ├─ Redis Token-Bucket (全局)     │  │
+│  │                 │   │                  │   │   └─ Local Token-Bucket (单机)     │  │
+│  └─────────────────┘   └──────────────────┘   └────────────────────────────────────┘  │
+│                                                                                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+                         │                         │
+                    ┌────▼─────┐             ┌─────▼──────┐
+                    │  Kafka   │             │   Redis    │
+                    │ 消息总线  │             │  Cluster   │
+                    └──────────┘             └────────────┘
+</code></pre>
+<hr />
+<h2 id="_5">三、模块一：实时网关压力聚合分析</h2>
+<h3 id="31">3.1 目标</h3>
+<p>实时统计每个网关实体（VNFPG、LBC、Node、Host）每分钟被探测的请求数（RPS），输出为时序指标写入 VictoriaMetrics，配合 Grafana + 告警规则，第一时间感知网关压力异常。</p>
+<h3 id="32">3.2 数据流</h3>
+<pre><code>  Agent 探测结果
+       │
+       ▼
+  metric_processor (原有)  ─── Kafka (raw metric topic) ───┐
+                                                            │
+                                                            ▼
+                                                    ┌──────────────┐
+                                                    │meta_injector │
+                                                    │              │
+                                                    │ 1. 消费 raw  │
+                                                    │    metric    │
+                                                    │              │
+                                                    │ 2. 解码      │
+                                                    │    Snappy +  │
+                                                    │    Protobuf  │
+                                                    │              │
+                                                    │ 3. 按 dst_ip │
+                                                    │    查询元数据 │
+                                                    │   (autotagging│
+                                                    │    EIP/ELB/  │
+                                                    │    LBC/Host) │
+                                                    │              │
+                                                    │ 4. 展开为多条│
+                                                    │  EnrichedTS  │
+                                                    │  (每网关实体 │
+                                                    │   一条)      │
+                                                    │              │
+                                                    │ 5. JSON 序列 │
+                                                    │   化写Kafka  │
+                                                    └──────┬───────┘
+                                                           │
+                                                  Kafka (enriched topic)
+                                                           │
+                                                           ▼
+                                                    ┌──────────────┐
+                                                    │risk_analysis │
+                                                    │              │
+                                                    │ 1. 消费 JSON │
+                                                    │    batch     │
+                                                    │              │
+                                                    │ 2. 按         │
+                                                    │  gw_entity_id│
+                                                    │  聚合 count   │
+                                                    │  (每分钟窗口) │
+                                                    │              │
+                                                    │ 3. 输出指标   │
+                                                    │  rtt_gw_     │
+                                                    │  pressure    │
+                                                    │              │
+                                                    │ 4. 写入       │
+                                                    │  Victoria    │
+                                                    │  Metrics     │
+                                                    └──────────────┘
+</code></pre>
+<h3 id="33">3.3 关键设计</h3>
+<h4 id="meta_injector">meta_injector：元数据注入</h4>
+<ul>
+<li><strong>输入</strong>：原始探测 metric 流（Snappy+Protobuf 编码的 <code>prompb.WriteRequest</code>）</li>
+<li><strong>元数据查询</strong>：通过 <code>autotagging.TaggingService</code> 按 <code>dst_ip</code> 查询网关元信息</li>
+<li>EIP → 提取 <code>vnfpg[0].uuid / type</code></li>
+<li>LBC → 提取 <code>uuid / name</code></li>
+<li>Host → 提取 <code>hostname</code></li>
+<li><strong>缓存策略</strong>：内存 <code>map[ip]cachedGWMeta</code>，TTL 5 分钟，上限 10 万条，超限后 LRU 淘汰</li>
+<li><strong>输出</strong>：<code>EnrichedMetricBatch</code> JSON → Kafka enriched topic</li>
+</ul>
+<pre><code class="language-go">type EnrichedMetricTS struct {
+    TaskID, Project, SrcIP, DstIP, Metric string
+    TsMs         int64
+    Value        float64
+    EntityType   string  // vnfpg / lbc / node / host
+    EntityID     string
+    EntityName   string
+    MetaProject  string
+    PingInterval int64
+    Labels       map[string]string
+}
+</code></pre>
+<h4 id="risk_analysisgwrpsvaluehandler">risk_analysis（GWRPSValueHandler）：网关压力聚合</h4>
+<ul>
+<li><strong>聚合引擎</strong>：<code>AggrProcessor</code> + Event-Time Windowing</li>
+<li>按 <code>gw_entity_id</code> 分桶（hash buckets）</li>
+<li>每分钟一个窗口，窗口内对 count 累加</li>
+<li>支持乱序容忍（<code>AllowedLatenessSec</code>）和补偿刷新（<code>LateCompensate</code>）</li>
+<li><strong>聚合 Key</strong>：<code>labels.GwEntityID</code>（即 vnfpg uuid / lbc uuid / node hostname / host IP）</li>
+<li><strong>输出指标</strong>：</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>指标名</th>
+<th>Labels</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rtt_gw_pressure</code></td>
+<td><code>entity_type</code>, <code>entity_id</code>, <code>entity_name</code>, <code>project</code>, <code>env</code>, <code>version</code></td>
+<td>该网关实体每分钟被探测次数</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>异步 Sink</strong>：通过带缓冲 channel（10000）+ 后台 worker 批量推送 VictoriaMetrics，避免聚合主路径被写入阻塞</li>
+</ul>
+<h3 id="34">3.4 告警配置（示例）</h3>
+<pre><code class="language-yaml"># Grafana/Prometheus alerting rule
+- alert: GW_RPS_High
+  expr: rtt_gw_pressure{entity_type=&quot;vnfpg&quot;} &gt; 5000
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: &quot;网关 {{ $labels.entity_name }} 探测 RPS 超过 5000&quot;
+</code></pre>
+<hr />
+<h2 id="_6">四、模块二：增量探测创建时风险检测</h2>
+<h3 id="41">4.1 目标</h3>
+<p>用户创建/修改探测任务时，<strong>在任务实际生效前</strong>估算该任务对网关的影响，给出风险报告（Warn/Error）。</p>
+<h3 id="42">4.2 流程图</h3>
+<pre><code>  用户前端
+    │
+    ▼
+  POST /risk_check/  (携带 BaseGenericTask)
+    │
+    ▼
+  RiskCheckSvc.Commit()
+    │  ① 频率限制（防止频繁提交）
+    │     → global.TokenAccess(&quot;front:rskctrl:{taskId|user}&quot;)
+    │
+    │  ② 构造 GenericTask(EventType=EventIdCheck)，
+    │     通过 Kafka 通知 generic_task_event 模块
+    │
+    ▼
+  generic_task_event (异步消费)
+    │
+    ▼
+  RiskCheckEvent.Handle()
+    │
+    │  ① 模拟任务展开：解析 src/dst 分组、生成完整探测链路
+    │     → LoggedTask.Process()
+    │     → 计算 LinkNum, PingInterval, Groups
+    │
+    │  ② 风险评估检查（selfCheck）：
+    │     - PingInterval &lt; 1？  → Error
+    │     - Transport协议 &amp;&amp; PingInterval &lt; 5？ → Error
+    │     - HTTP协议 &amp;&amp; PingInterval &lt; 15？ → Error
+    │
+    │  ③ 链路数阈值检查：
+    │     - LinkNum &gt; 1000 &amp;&amp; PingInterval ≤ 1 → Warn
+    │     - LinkNum &gt; 10000 &amp;&amp; PingInterval ≤ 1 → Error
+    │     - Groups &gt; 10000 → Warn（影响展示）
+    │     - LinkNum &gt; 500000 → Warn
+    │     - LinkNum &gt; 100000 → Warn（谨慎操作）
+    │
+    │  ④ 网关压力增量评估（核心算法）：
+    │     AddQPS = LinkNum / PingInterval
+    │     AvgQPS = 过去 2h 内该网关 rtt_gw_pressure 的最高 RPS
+    │     TotalQPS = AvgQPS + AddQPS
+    │     → 生成 GwPressureItem 列表，写入 Report.Tips
+    │
+    │  ⑤ 生成 Report → 存 Redis（key=eventID，过期自动清理）
+    │
+    ▼
+  GET /risk_check/:event_id  →  查询 Report
+    │
+    ▼
+  前端展示风险报告（Warn / Error 列表）
+</code></pre>
+<h3 id="43-report">4.3 Report 数据结构</h3>
+<pre><code class="language-go">type Report struct {
+    Dst, Src        Side
+    IntervalDataNum int64
+    LinkNum         int64
+    Groups          map[string]struct{}
+    PingInterval    int64
+    TaskID          int64
+    TaskName        string
+    Tips            Tip    // { Warn: [], Error: [] }
+}
+
+type GwPressureItem struct {
+    EntityType string   // vnfpg / lbc
+    EntityID   string
+    AddQPS     float64  // 新增任务产生的 RPS = LinkNum / PingInterval
+    AvgQPS     float64  // 过去 2h 最高 RPS（由模块一的聚合所得）
+    TotalQPS   float64  // AvgQPS + AddQPS
+}
+</code></pre>
+<hr />
+<h2 id="_7">五、模块三：多维度可配置实时限流</h2>
+<h3 id="51">5.1 目标</h3>
+<p>对于突发或不可预测因素导致的探测压力陡增，通过多维度（按项目/按协议/按目标类型/全局）的实时限流机制进行拦截。</p>
+<h3 id="52">5.2 架构总览</h3>
+<pre><code>  Agent 集群
+    │
+    │  gRPC (双向流 / Unary)  或  HTTP
+    │
+    ▼
+ ┌───────────────────────────────────────────────────────────────┐
+ │                     Controller                                │
+ │                                                               │
+ │  gRPC Stream Handler          Unary gRPC Handler              │
+ │  ┌─────────────────┐         ┌───────────────────────┐       │
+ │  │HandleGlobalLimit│         │GlobalLimit             │       │
+ │  │HandleBatchLimit │         │BatchGlobalLimit        │       │
+ │  └───────┬─────────┘         └──────────┬────────────┘       │
+ │          │                              │                     │
+ │          │         HTTP Handler         │                     │
+ │          │    ┌──────────────────┐      │                     │
+ │          │    │/api/v1/rate_limit│      │                     │
+ │          │    │/api/v2/rate_limit│      │                     │
+ │          │    │/api/v2/batch_... │      │                     │
+ │          │    └───────┬──────────┘      │                     │
+ │          │            │                 │                     │
+ │          ▼            ▼                 ▼                     │
+ │  ┌─────────────────────────────────────────────────────┐     │
+ │  │               RateLimitSvc                          │     │
+ │  │                                                     │     │
+ │  │  ┌──────────────────────────────────────────┐       │     │
+ │  │  │ 限流配置 (MongoDB, 每 5s 热加载)          │       │     │
+ │  │  │                                          │       │     │
+ │  │  │ ProjectLimiterConfig:                    │       │     │
+ │  │  │   project + project_type + target_type   │       │     │
+ │  │  │   + protocol → { limit, burst }          │       │     │
+ │  │  └──────────────────────────────────────────┘       │     │
+ │  │                    │                                │     │
+ │  │     ┌──────────────┼──────────────┐                 │     │
+ │  │     ▼              ▼              ▼                 │     │
+ │  │  项目级匹配     通配匹配       全局默认              │     │
+ │  │  p1-task-dst   all-task-dst   defLimiter            │     │
+ │  │  -tcp          -tcp                                 │     │
+ │  │     │              │              │                 │     │
+ │  │     ▼              ▼              ▼                 │     │
+ │  │  ┌─────────────────────────────────────┐            │     │
+ │  │  │    Token Bucket (令牌桶)             │            │     │
+ │  │  │                                     │            │     │
+ │  │  │  local.SingleLimiter  (单机版)       │            │     │
+ │  │  │    └─ golang.org/x/time/rate        │            │     │
+ │  │  │    └─ 每 visitor 独立桶             │            │     │
+ │  │  │                                     │            │     │
+ │  │  │  global.Limiter  (Redis 集群版)      │            │     │
+ │  │  │    └─ Lua Token-Bucket 脚本          │            │     │
+ │  │  │    └─ EVALSHA + NOSCRIPT fallback   │            │     │
+ │  │  │    └─ Redis Cluster Hash Tag 路由    │            │     │
+ │  │  └─────────────────────────────────────┘            │     │
+ │  └─────────────────────────────────────────────────────┘     │
+ │                                                               │
+ │  监控埋点:                                                    │
+ │    RequestQps (QPS/status/code)                               │
+ │    RequestDelay (延迟直方图)                                    │
+ │    RequestThrottling (按项目的限流计数)                          │
+ └───────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="53">5.3 限流配置模型</h3>
+<p>配置存储在 MongoDB，由 <code>RateLimitSvc</code> 每 5 秒热加载，<strong>支持动态增删改</strong>（删除配置后对应 limiter 自动移除）。</p>
+<pre><code class="language-go">type ProjectLimiterConfig struct {
+    Project     string  // 项目名，&quot;all&quot; 表示通配
+    TargetType  string  // dst / src / 目标类型
+    ProjectType string  // task / src / dst
+    Protocol    string  // tcp / icmp / http / &quot;all&quot; 通配
+    Limit       int     // 令牌桶速率 (tokens/sec)
+    Burst       int     // 令牌桶容量
+}
+</code></pre>
+<p><strong>多级匹配逻辑</strong>（优先级从高到低）：</p>
+<pre><code>1. project + projectType + targetType + protocol  → 精确匹配
+2. &quot;all&quot;   + projectType + targetType + protocol  → 项目通配
+3. &quot;all&quot;   + projectType + targetType + &quot;all&quot;     → 项目+协议通配
+4. defLimiter                                     → 全局兜底
+</code></pre>
+<h3 id="54">5.4 令牌桶实现</h3>
+<h4 id="localsinglelimiter">单机版（local.SingleLimiter）</h4>
+<ul>
+<li>基于 <code>golang.org/x/time/rate.Limiter</code></li>
+<li>每个 target IP 独立桶（<code>map[string]*visitor</code>）</li>
+<li>后台 goroutine 定期清理过期 visitor</li>
+<li>适用于 v1 API（流式 gRPC handler）</li>
+</ul>
+<h4 id="redis-globallimiter">Redis 集群版（global.Limiter）</h4>
+<ul>
+<li>原子 Lua 脚本实现 Token-Bucket，保证多实例一致性</li>
+<li>支持 Redis Cluster（Hash Tag <code>{key}</code> 保证同 slot）</li>
+<li>EVALSHA 优先 + NOSCRIPT 自动 fallback</li>
+<li>支持配置 rate/burst/cost/TTL</li>
+<li>适用于 v2 API 和 Unary gRPC</li>
+</ul>
+<pre><code class="language-lua">-- 核心 Lua 逻辑（简化）
+local tokens = redis.call(&quot;HGET&quot;, key, &quot;tokens&quot;) or burst
+local delta  = (now_ms - last_ts) / 1000 * rate
+tokens = min(burst, tokens + delta)
+
+if tokens &gt;= cost then
+    tokens = tokens - cost
+    return {1, tokens, ...}   -- allowed
+else
+    return {0, tokens, retry_after_ms, ...}  -- rejected
+end
+</code></pre>
+<h3 id="55">5.5 接入协议对比</h3>
+<table>
+<thead>
+<tr>
+<th>接入方式</th>
+<th>方法</th>
+<th>后端 Limiter</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>gRPC 双向流</td>
+<td><code>HandleGlobalLimit</code></td>
+<td>local SingleLimiter</td>
+<td>老版 Agent，单连接复用</td>
+</tr>
+<tr>
+<td>gRPC 双向流</td>
+<td><code>HandleBatchGlobalLimit</code></td>
+<td>local SingleLimiter</td>
+<td>老版 Agent 批量</td>
+</tr>
+<tr>
+<td>gRPC Unary</td>
+<td><code>GlobalLimit</code></td>
+<td>Redis global Limiter</td>
+<td>新版 Agent，低延迟</td>
+</tr>
+<tr>
+<td>gRPC Unary</td>
+<td><code>BatchGlobalLimit</code></td>
+<td>Redis global Limiter</td>
+<td>新版 Agent 批量</td>
+</tr>
+<tr>
+<td>HTTP</td>
+<td><code>/api/v1/rate_limit</code></td>
+<td>local SingleLimiter</td>
+<td>兼容接入</td>
+</tr>
+<tr>
+<td>HTTP</td>
+<td><code>/api/v2/rate_limit</code></td>
+<td>Redis global Limiter</td>
+<td>推荐 HTTP 接入</td>
+</tr>
+<tr>
+<td>HTTP</td>
+<td><code>/api/v2/batch_rate_limit</code></td>
+<td>Redis global Limiter</td>
+<td>推荐 HTTP 批量</td>
+</tr>
+</tbody>
+</table>
+<h3 id="56-proto">5.6 Proto 定义</h3>
+<pre><code class="language-protobuf">service RateLimitUService {
+  rpc GlobalLimit(RateLimitRequest)      returns (RateLimitReply);
+  rpc BatchGlobalLimit(BatchRateLimitRequest) returns (BatchRateLimitReply);
+}
+
+message RateLimitRequest {
+  string type = 1;       // global / mtr
+  string project = 2;
+  string src = 3;
+  string target = 4;
+  int64  start_time = 5;
+  string key = 6;        // &quot;dstType=value;...&quot; 多维度 key
+  string protocol = 7;
+  string sp = 8;         // src_project
+  string dp = 9;         // dst_project
+  uint32 taskID = 12;
+}
+</code></pre>
+<h3 id="57">5.7 监控埋点</h3>
+<p>三个 Prometheus 指标通过 <code>apistats.APIStat</code> 统一采集，由 vmlog 每 10 秒推送 VictoriaMetrics：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>类型</th>
+<th>Labels</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fmsh_self_request_qps</code></td>
+<td>Counter</td>
+<td>instance, host, method, status, code</td>
+<td>请求 QPS，按 status=429 过滤可得限流 QPS</td>
+</tr>
+<tr>
+<td><code>fmsh_self_request_delay</code></td>
+<td>Histogram</td>
+<td>instance, host, method, status, code</td>
+<td>请求延迟分布</td>
+</tr>
+<tr>
+<td><code>fmsh_self_request_throttling</code></td>
+<td>Counter</td>
+<td>instance, host, method, project</td>
+<td>限流计数（按项目维度统计被拦截数）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>注意</strong>：<code>RequestThrottling</code> 必须在 <code>registry.MustRegister()</code> 中注册，否则 vmlog 不会采集。</p>
+</blockquote>
+<hr />
+<h2 id="_8">六、三层防护联动</h2>
+<pre><code>               时间维度
+  ─────────────────────────────────────────────────────────►
+
+  【事前】                  【实时】                 【可观测】
+  创建任务时                任务运行中               全程持续
+     │                        │                       │
+     ▼                        ▼                       ▼
+  ┌─────────┐           ┌──────────┐           ┌──────────┐
+  │风险检测  │           │实时限流   │           │压力聚合   │
+  │         │           │          │           │          │
+  │ 算法：   │           │ 令牌桶    │           │ 聚合窗口  │
+  │ Total =  │           │ 配置热加载│           │ 1min     │
+  │ Max2h +  │  ─ 通过 → │ 多维度    │  ─ 采集 → │          │
+  │ AddQPS   │           │ 匹配     │           │ 输出指标  │
+  │         │           │          │           │ rtt_gw_  │
+  │ 风险提示 │  ─ 拒绝 → │ 429拦截  │           │ pressure │
+  │         │           │          │           │          │
+  │ Warn/   │           │ 事件投递  │           │ Grafana  │
+  │ Error   │           │ → Kafka  │           │ + Alert  │
+  └─────────┘           └──────────┘           └──────────┘
+       │                      │                      │
+       │                      │                      │
+       ▼                      ▼                      ▼
+   ┌──────────────────────────────────────────────────────┐
+   │                运维 / 开发 / SRE                      │
+   │                                                      │
+   │  • 创建任务前看到风险提示 → 调整参数                    │
+   │  • 异常限流时收到告警   → 排查 + 调整配置               │
+   │  • 实时 Dashboard 观测各网关 RPS 水位                  │
+   └──────────────────────────────────────────────────────┘
+</code></pre>
+<hr />
+<h2 id="_9">七、关键技术点总结</h2>
+<h3 id="71-event-time-windowing">7.1 Event-Time Windowing 聚合引擎</h3>
+<ul>
+<li>支持乱序事件（<code>AllowedLatenessSec</code>），watermark 策略可选 <code>max_event_time</code> / <code>avg_event_time(EWMA)</code></li>
+<li>迟到事件补偿模式（<code>LateCompensate</code>），已 flush 的窗口允许在 <code>MaxCompensationSec</code> 内更新并重发</li>
+<li>空闲窗口自动驱逐（<code>EvictIdleSec</code>），防止内存泄漏</li>
+<li>Hash-Bucket 分片降低锁粒度</li>
+</ul>
+<h3 id="72-redis-cluster">7.2 Redis Cluster 令牌桶</h3>
+<ul>
+<li>单 key 原子操作（Lua EVALSHA），无需分布式锁</li>
+<li>Hash Tag <code>{key}</code> 保证 key 路由到同一 slot</li>
+<li>自适应 TTL：<code>2 * (burst/rate)</code> 秒，自动清理冷 key</li>
+<li>NOSCRIPT 自动降级（EVALSHA → EVAL → reload）</li>
+</ul>
+<h3 id="73">7.3 动态配置热加载</h3>
+<ul>
+<li>MongoDB 存储限流规则，<code>updateLimiters()</code> 每 5s 全量拉取</li>
+<li><strong>增量对比</strong>：limiter 未变化则复用实例（避免重建开销）</li>
+<li><strong>删除感知</strong>：重建 map 后原子替换（<code>RLock</code> 读旧 + <code>Lock</code> 写新），已删除配置的 limiter 自动移除</li>
+<li>多级匹配（精确 → 项目通配 → 协议通配 → 全局兜底）</li>
+</ul>
+<h3 id="74">7.4 压测工具</h3>
+<p><code>modules/ratelimit_client_grpc_unary/</code> 提供了完整的 gRPC Unary 限流压测 CLI：<br />
+- 支持配置并发、QPS、持续时间<br />
+- 支持单次/批量两种模式<br />
+- 实时统计延迟（P50/P90/P99）、成功率、限流率<br />
+- 支持 TLS、gzip 压缩</p>
+<hr />
+<h2 id="_10">八、部署拓扑</h2>
+<pre><code>┌──────────────────────────────────────────────────────────────┐
+│                       Kafka Cluster                          │
+│   raw_metric_topic  ──►  enriched_topic                     │
+└──────────┬────────────────────────┬──────────────────────────┘
+           │                        │
+    ┌──────▼──────┐          ┌──────▼──────┐
+    │meta_injector│          │risk_analysis│
+    │ (N replicas)│          │ (N replicas)│
+    └─────────────┘          └──────┬──────┘
+                                    │
+                             ┌──────▼──────┐
+                             │Victoria     │
+                             │Metrics      │
+                             └─────────────┘
+                                    │
+┌───────────────────────────────────▼──────────────────────────┐
+│                     Controller Cluster                        │
+│                                                               │
+│   controller-1 ◄──── Redis Cluster ────► controller-2        │
+│        │                                      │               │
+│   gRPC:30025                            gRPC:30025           │
+│   HTTP:30026                            HTTP:30026           │
+│                                                               │
+│   Mongo (限流配置)                                             │
+└───────────────────────────────────────────────────────────────┘
+           │
+     Agent 集群
+</code></pre>
+<hr />
+<h2 id="faq">九、FAQ</h2>
+<p><strong>Q1: 限流规则修改后多久生效？</strong><br />
+A: <code>updateLimiters()</code> 每 5 秒拉取一次 MongoDB，因此最迟 5 秒生效。</p>
+<p><strong>Q2: Redis 集群版和单机版 limiter 如何选择？</strong><br />
+A: v1 API 使用单机版（兼容老 Agent），v2 API 和 Unary gRPC 使用 Redis 集群版（多实例全局一致）。</p>
+<p><strong>Q3: 风险检测是同步还是异步？</strong><br />
+A: 异步。<code>Commit</code> 接口返回 <code>event_id</code> 后，任务展开和风险评估在 <code>generic_task_event</code> 模块异步执行，前端轮询 <code>QueryResult</code> 获取报告。</p>
+<p><strong>Q4: 网关压力聚合的延迟是多少？</strong><br />
+A: meta_injector 实时消费 + risk_analysis 1 分钟窗口 + 10 秒 flush，端到端约 70~80 秒。</p>
+<p><strong>Q5: 如何新增一个限流维度？</strong><br />
+A: 在 MongoDB <code>ProjectLimiterConfig</code> 中新增一条记录，指定 project/projectType/targetType/protocol + limit/burst 即可，无需重启。</p>
+<hr />
+<h2 id="agent">十、Agent 端限流集成</h2>
+<blockquote>
+<p>前面章节聚焦在<strong>服务端</strong>（Controller / Redis / MongoDB）的限流能力建设。本节介绍 <strong>Agent 端</strong>如何与服务端限流体系协同，在探测执行前完成实时限流判定。</p>
+</blockquote>
+<h3 id="101">10.1 整体协作流程</h3>
+<pre><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Agent 进程                                        │
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │                     TimeWheel (时间轮)                           │       │
+│  │                                                                  │       │
+│  │  tick (1s) ──► handleTick()                                      │       │
+│  │                 │                                                │       │
+│  │                 ├─ 1. 收集当前 bucket 中开启 OpenGlobalRateLimit  │       │
+│  │                 │    的任务，构造 BatchRateLimitRequest           │       │
+│  │                 │                                                │       │
+│  │                 ├─ 2. gRPC Unary 调用服务端 BatchGlobalLimit     │       │
+│  │                 │    (5s 超时)                                    │       │
+│  │                 │                                                │       │
+│  │                 ├─ 3. 根据服务端返回逐任务判定:                    │       │
+│  │                 │    ├─ 批量失败 → 跳过执行, 仅回调               │       │
+│  │                 │    ├─ 单任务被拒 → 跳过执行, 仅回调             │       │
+│  │                 │    └─ 允许通过 → cmd.Run() 探测 + 回调          │       │
+│  │                 │                                                │       │
+│  │                 └─ 4. 循环任务重新入轮 / 一次性任务回收            │       │
+│  └──────────────────────────────────────────────────────────────────┘       │
+│                          │                                                  │
+│                          │ gRPC (BatchGlobalLimit)                          │
+│                          ▼                                                  │
+└──────────────────────────┬──────────────────────────────────────────────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │  Controller (服务端)    │
+              │  Redis Token-Bucket    │
+              │  多维度限流判定         │
+              └────────────────────────┘
+</code></pre>
+<h3 id="102-timewheel">10.2 TimeWheel 时间轮调度引擎</h3>
+<p>Agent 端的任务调度核心是一个自研的 <strong>分层时间轮</strong>（<code>TimeWheel</code>），负责管理所有探测任务的定时触发。</p>
+<h4 id="_11">核心结构</h4>
+<pre><code class="language-go">type TimeWheel struct {
+    tick          time.Duration       // 时钟精度（通常 1s）
+    ticker        *time.Ticker
+    tickQueue     chan time.Time       // TickSafeMode 下的中转队列
+
+    bucketsNum    int
+    Buckets       []map[taskID]*Task   // 环形桶数组，每个桶存放到期任务
+    bucketIndexes map[taskID]int       // taskID → 所在桶的索引
+
+    currentIndex  int                  // 当前时钟指针
+
+    addC    chan *Task                 // 新增任务信号
+    removeC chan *Task                 // 删除任务信号
+    stopC   chan struct{}              // 停止信号
+
+    gopool  *grpool.Pool              // 异步执行 worker 池
+}
+</code></pre>
+<h4 id="_12">调度模式</h4>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>API</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>周期任务</td>
+<td><code>AddCron(delay, deadline, callback, cmd)</code></td>
+<td>循环执行，每次到期后重新入轮</td>
+</tr>
+<tr>
+<td>延迟单次</td>
+<td><code>AfterFunc(delay, deadline, callback, cmd)</code></td>
+<td>延迟触发一次后转为周期任务（用于错峰启动）</td>
+</tr>
+<tr>
+<td>一次性</td>
+<td><code>Add(delay, deadline, callback, cmd)</code></td>
+<td>执行一次后回收</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_13">任务生命周期</h4>
+<pre><code>addAny() → addC channel → store(task)
+    │
+    ├── 计算 round = delay / (tick * bucketsNum)
+    ├── 计算 index = (currentIndex + delay/tick) % bucketsNum
+    └── 放入 Buckets[index]
+
+每次 tick:
+    handleTick() → 取出 Buckets[currentIndex]
+        │
+        ├── task.stop == true  → collectTask() 回收
+        ├── task.deadline 过期 → collectTask() 回收
+        ├── task.round &gt; 0     → round-- 跳过本轮
+        ├── 限流判定（见 10.3）
+        └── task.circle        → collectTask() + putCircle() 重新入轮
+</code></pre>
+<h4 id="worker-grpool">Worker 池（grpool）</h4>
+<p>异步任务（<code>task.async == true</code>）通过 <code>grpool</code> 执行，避免阻塞时间轮主循环：</p>
+<pre><code class="language-go">// 异步投递到 worker 池
+tw.gopool.JobQueue &lt;- func(task *Task) func() {
+    return func() {
+        task.cmd.Run()
+        task.callback(task)
+    }
+}(task)
+</code></pre>
+<p><code>grpool</code> 采用经典的 <strong>worker-dispatcher</strong> 模型：<br />
+- 固定数量的 worker goroutine（默认 50）<br />
+- dispatcher 从 JobQueue 取任务分发给空闲 worker<br />
+- JobQueue 带缓冲（默认 10000），防止瞬时任务堆积</p>
+<h3 id="103-handletick">10.3 批量限流判定（handleTick 核心逻辑）</h3>
+<p>每次时间轮 tick 触发时，<code>handleTick</code> 会对当前桶中的任务进行 <strong>批量限流预检</strong>：</p>
+<h4 id="_14">步骤一：收集需要限流的任务</h4>
+<pre><code class="language-go">for _, task := range bucket {
+    if !task.cmd.GenericPinglist.OpenGlobalRateLimit {
+        continue  // 未开启全局限流的任务直接跳过
+    }
+    subRequests = append(subRequests, &amp;generated.RateLimitRequest{
+        Type:      &quot;global&quot;,
+        Project:   task.cmd.Project,
+        Src:       task.cmd.GetDialIP(),
+        Target:    task.cmd.GetTarget(),
+        StartTime: lib.Now(),
+        Key:       task.cmd.GetRateLimitKey(),  // &quot;srcKey,dstKey&quot; 多维度
+        Protocol:  task.cmd.Protocol.String(),
+        Sp:        task.cmd.SrcSixTuples.Project,
+        Dp:        task.cmd.DstSixTuples.Project,
+    })
+    taskIndex[task] = seq
+    seq++
+}
+</code></pre>
+<h4 id="grpc">步骤二：批量 gRPC 调用</h4>
+<pre><code class="language-go">if len(subRequests) &gt; 0 {
+    ctx, cancel := context.WithTimeout(common.CancelCtx, time.Second*5)
+    defer cancel()
+    resp, err = client.GetRateLimitUServiceClient().BatchGlobalLimit(ctx, &amp;batchRequest)
+    if err != nil || resp == nil || !resp.Ok {
+        someFailed = true  // 批量级失败
+    }
+}
+</code></pre>
+<p><strong>关键设计</strong>：<br />
+- 同一个 bucket 中开启限流的任务<strong>合并为一次批量 RPC</strong>，大幅减少网络往返<br />
+- 设置 5 秒超时，防止 RPC 延迟拖慢整个时间轮<br />
+- 基于 <code>common.CancelCtx</code> 派生，Agent 停止时自动取消</p>
+<h4 id="_15">步骤三：逐任务判定执行</h4>
+<pre><code>                    ┌─ someFailed (批量失败)?
+                    │   ├─ Yes → 跳过 cmd.Run(), 仅执行 callback
+                    │   └─ No ──┐
+                    │            ├─ 该任务在 taskIndex 中且被拒?
+                    │            │   ├─ Yes → 跳过 cmd.Run(), 记录限流日志
+                    │            │   └─ No → cmd.Run() 执行探测 + callback
+                    │            └─ 该任务未开启限流?
+                    │                └─ 直接 cmd.Run() + callback
+                    └───────────────────────────────────────────────
+</code></pre>
+<h3 id="104">10.4 任务调度与限流模式</h3>
+<p><code>TimeWheelsScheduler</code> 是 Agent 端的任务调度器，将服务端下发的 <code>GenericPinglist</code> 转换为 TimeWheel 中的定时任务。</p>
+<h4 id="ratelimitmode">限流模式（RateLimitMode）</h4>
+<p>服务端下发任务时通过 <code>RateLimitMode</code> 字段指定 Agent 端的限流策略：</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>值</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RateLimitModeRand</code></td>
+<td>1</td>
+<td>Agent 在 <code>[0, PingInterval)</code> 范围内随机偏移，错峰发送</td>
+</tr>
+<tr>
+<td><code>RateLimitModeDirect</code></td>
+<td>2</td>
+<td>使用服务端指定的固定偏移量 <code>Offset</code></td>
+</tr>
+<tr>
+<td><code>RateLimitModeGlobal</code></td>
+<td>3</td>
+<td>配合 <code>OpenGlobalRateLimit=true</code>，走服务端全局限流</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-go">switch task.RateLimitMode {
+case constant.RateLimitModeRand:
+    offset = e.rnd.Int63n(int64(time.Duration(task.PingInterval) * time.Second))
+case constant.RateLimitModeDirect:
+    offset = task.Offset
+}
+</code></pre>
+<h4 id="_16">任务均匀散列</h4>
+<p>对于同一批次的 N 个探测目标，Agent 将它们在 <code>PingInterval</code> 内均匀分散：</p>
+<pre><code>散列间隔 s = PingInterval / len(targets)
+
+target[0] → 偏移 offset
+target[1] → 偏移 offset + s
+target[2] → 偏移 offset + 2s
+...
+target[N] → 偏移 offset + N*s
+</code></pre>
+<p>这种<strong>客户端预散列</strong>机制与服务端限流形成互补——即使不开启全局限流，Agent 自身也会尽量把请求打散。</p>
+<h4 id="ratelimitkey">RateLimitKey 多维度路由</h4>
+<p>每个探测目标携带 <code>RateLimitKey</code>（由服务端在配置中注入），格式为 <code>"srcKey,dstKey"</code>，其中 key 包含 <code>dstType=value;...</code> 等多维度标签。服务端据此匹配到对应的限流桶（project + targetType + protocol 等）。</p>
+<pre><code class="language-go">func (b BaseCommand) GetRateLimitKey() string {
+    if b.SrcSixTuples.RateLimitKey == &quot;&quot; &amp;&amp; b.DstSixTuples.RateLimitKey == &quot;&quot; {
+        return &quot;&quot;
+    }
+    return b.SrcSixTuples.RateLimitKey + &quot;,&quot; + b.DstSixTuples.RateLimitKey
+}
+</code></pre>
+<h3 id="105-agent-grpc">10.5 Agent 端限流的 gRPC 连接管理</h3>
+<p>Agent 通过 <code>GetRateLimitUServiceClient()</code> 获取与 Controller 的 gRPC 连接：</p>
+<ul>
+<li><strong>复用连接</strong>：限流 RPC 与其他控制面 RPC 共享同一个 gRPC 连接池</li>
+<li><strong>懒初始化</strong>：首次调用时建连，避免无限流任务时的无效连接</li>
+<li><strong>异常熔断</strong>：连接不可用时 <code>someFailed = true</code>，该 tick 内所有限流任务降级（跳过执行、仅回调）</li>
+</ul>
+<h3 id="106">10.6 任务到期与回收</h3>
+<p>Agent 端通过两级机制保证任务不会无限运行：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>触发条件</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Deadline 过期</strong></td>
+<td><code>time.Now().Unix() &gt; task.deadline</code></td>
+<td>handleTick 中直接回收</td>
+</tr>
+<tr>
+<td><strong>执行次数上限</strong></td>
+<td><code>task.Times &gt;= ConsPackNum</code></td>
+<td>callback 中调用 <code>CancelTask</code></td>
+</tr>
+<tr>
+<td><strong>手动停止</strong></td>
+<td><code>task.stop = true</code></td>
+<td>下次 handleTick 时回收</td>
+</tr>
+<tr>
+<td><strong>任务组删除</strong></td>
+<td><code>deleteTasks(groupId)</code></td>
+<td>遍历组内所有任务逐一取消</td>
+</tr>
+</tbody>
+</table>
+<h4 id="syncpool">sync.Pool 对象复用</h4>
+<p>开启 <code>syncPool</code> 模式后，回收的 <code>Task</code> 对象通过 <code>sync.Pool</code> 复用，减少 GC 压力：</p>
+<pre><code class="language-go">func (tw *TimeWheel) collectTask(task *Task) {
+    index := tw.bucketIndexes[task.id]
+    delete(tw.bucketIndexes, task.id)
+    delete(tw.Buckets[index], task.id)
+    if tw.syncPool {
+        defaultTaskPool.put(task)  // Reset + 归还 pool
+    }
+}
+</code></pre>
+<h3 id="107-agent-server">10.7 Agent ↔ Server 限流协作全景</h3>
+<pre><code>  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                          任务下发阶段                                    │
+  │                                                                          │
+  │  Server 配置:                           Agent 接收:                      │
+  │   GenericPinglist {                      TimeWheelsScheduler              │
+  │     RateLimitMode: 1/2/3                 ├─ mode=1: 随机偏移入轮          │
+  │     OpenGlobalRateLimit: true/false      ├─ mode=2: 固定偏移入轮          │
+  │     PingInterval: 10                     └─ mode=3: 入轮 + 标记全局限流   │
+  │     Offset: xxx                                                          │
+  │     Data[].RateLimitKey: &quot;dstType=...&quot;                                   │
+  │   }                                                                      │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                          探测执行阶段                                    │
+  │                                                                          │
+  │  TimeWheel tick ──► handleTick()                                         │
+  │    │                                                                     │
+  │    ├─ 【客户端预限流】任务已按 PingInterval/N 均匀散列                     │
+  │    │                                                                     │
+  │    ├─ 【服务端限流】OpenGlobalRateLimit=true 的任务:                       │
+  │    │   ├─ 合并构造 BatchRateLimitRequest                                 │
+  │    │   ├─ gRPC → Controller → Redis Token-Bucket                         │
+  │    │   └─ 响应: Results[i].Ok → 允许/拒绝                                │
+  │    │                                                                     │
+  │    └─ 执行判定:                                                          │
+  │        ├─ 通过 → cmd.Run() (ICMP/TCP/HTTP探测) → callback → 上报数据     │
+  │        └─ 拒绝 → 跳过探测 → callback → 仅上报空结果或跳过                 │
+  └──────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="108">10.8 关键设计总结</h3>
+<table>
+<thead>
+<tr>
+<th>设计点</th>
+<th>方案</th>
+<th>收益</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>批量 RPC</strong></td>
+<td>同一 bucket 的限流请求合并为一次 BatchGlobalLimit</td>
+<td>减少 90%+ 的限流 RPC 次数</td>
+</tr>
+<tr>
+<td><strong>客户端预散列</strong></td>
+<td>按 PingInterval/N 均匀分散 + 随机偏移</td>
+<td>从源头降低瞬时 RPS 尖峰</td>
+</tr>
+<tr>
+<td><strong>异步 Worker 池</strong></td>
+<td>grpool dispatcher-worker 模型</td>
+<td>探测执行不阻塞时间轮 tick</td>
+</tr>
+<tr>
+<td><strong>优雅降级</strong></td>
+<td>批量 RPC 失败时 someFailed → 跳过执行但保持回调</td>
+<td>限流服务故障不导致 Agent 崩溃</td>
+</tr>
+<tr>
+<td><strong>多维度 Key</strong></td>
+<td>RateLimitKey 携带 src/dst/type 等标签</td>
+<td>服务端可按任意维度组合限流</td>
+</tr>
+<tr>
+<td><strong>Deadline 兜底</strong></td>
+<td>任务级 deadline + 执行次数上限</td>
+<td>即使调度异常，任务也不会永远执行</td>
+</tr>
+<tr>
+<td><strong>对象池复用</strong></td>
+<td>sync.Pool 回收 Task 对象</td>
+<td>高频创建/销毁场景下降低 GC 开销</td>
+</tr>
+</tbody>
+</table>
+</div>
+</body>
+</html>
